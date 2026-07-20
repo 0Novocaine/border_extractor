@@ -62,9 +62,12 @@
                 <div class="bg-white p-4 rounded-lg border border-slate-200 shadow-sm flex flex-col gap-2">
                     <label class="block text-sm font-semibold text-slate-700 mb-0">3. Действия:</label>
                     <button id="processBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg shadow-sm disabled:opacity-50 disabled:cursor-not-allowed transition-all">
-                        Извлечь маршрут
+                        Извлечь маршрут (по точкам)
                     </button>
-                    <button id="resetBtn" class="w-full bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-1 px-4 rounded-lg transition-all text-sm">
+                    <button id="extractContourBtn" class="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded-lg shadow-sm transition-all">
+                        🗺️ Весь внешний контур
+                    </button>
+                    <button id="resetBtn" class="w-full bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-1 px-4 rounded-lg transition-all text-sm mt-1">
                         Сбросить точки
                     </button>
                 </div>
@@ -91,17 +94,18 @@
     <script>
         // Инициализация карты Leaflet
         const map = L.map('map').setView([49.0, 31.0], 5); // Центр Украины по умолчанию
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        
+        // Используем серверы CARTO (Voyager), так как стандартные серверы OSM блокируют запросы без Referer (когда файл открыт через file:///)
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
             maxZoom: 19,
-            attribution: '© OpenStreetMap',
-            // Добавлено правило для обхода блокировок 403 от серверов OSM
-            referrerPolicy: 'no-referrer-when-downgrade' 
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
         }).addTo(map);
 
         // Состояние приложения
         let graph = new Map();      // Граф смежности: "x,y" -> Set("x1,y1", "x2,y2")
         let coordsDict = new Map(); // "x,y" -> [x, y]
         let nodesArray = [];        // Массив всех узлов для быстрого поиска
+        let currentGeoJSON = null;  // Сохраняем загруженный файл
         
         let baseGeojsonLayer = null;
         let resultGeojsonLayer = null;
@@ -117,6 +121,7 @@
         // Элементы UI
         const fileInput = document.getElementById('fileInput');
         const processBtn = document.getElementById('processBtn');
+        const extractContourBtn = document.getElementById('extractContourBtn');
         const resetBtn = document.getElementById('resetBtn');
         const statusMsg = document.getElementById('statusMsg');
         const downloadSection = document.getElementById('downloadSection');
@@ -192,6 +197,7 @@
         });
 
         function processGeoJSON(data) {
+            currentGeoJSON = data; // Сохраняем для извлечения полного контура
             updateStatus('Анализ геометрии и построение графа...');
             graph.clear();
             coordsDict.clear();
@@ -436,11 +442,14 @@
                 }]
             };
 
-            // Удаляем старый результат
+            displayAndDownloadGeoJSON(outGeoJSON, `Маршрут из ${outCoordinates.length} точек`);
+        }
+
+        // Общая функция для отрисовки и скачивания (используется обоими методами)
+        function displayAndDownloadGeoJSON(geoJsonData, successMessagePrefix) {
             if (resultGeojsonLayer) map.removeLayer(resultGeojsonLayer);
 
-            // Рисуем новый
-            resultGeojsonLayer = L.geoJSON(outGeoJSON, {
+            resultGeojsonLayer = L.geoJSON(geoJsonData, {
                 style: {
                     color: '#ef4444', // Ярко-красный
                     weight: 6,
@@ -450,8 +459,7 @@
                 }
             }).addTo(map);
 
-            // Создаем Blob для скачивания
-            const geoJsonStr = JSON.stringify(outGeoJSON, null, 2);
+            const geoJsonStr = JSON.stringify(geoJsonData, null, 2);
             const blob = new Blob([geoJsonStr], { type: "application/geo+json" });
             
             if (window.currentDownloadUrl) URL.revokeObjectURL(window.currentDownloadUrl);
@@ -460,8 +468,132 @@
             downloadLink.setAttribute("href", window.currentDownloadUrl);
             downloadSection.classList.remove('hidden');
             
-            updateStatus(`Успех! Маршрут из ${outCoordinates.length} точек построен.`);
+            updateStatus(`✅ Успех! ${successMessagePrefix} успешно сформирован.`);
         }
+
+        // --- НОВЫЙ АЛГОРИТМ: ИЗВЛЕЧЕНИЕ ВНЕШНЕГО КОНТУРА ---
+        extractContourBtn.addEventListener('click', () => {
+            if (!currentGeoJSON) {
+                updateStatus('Ошибка: Сначала загрузите файл!', true);
+                return;
+            }
+            
+            updateStatus('Анализ топологии: вычисляем внешние границы...');
+            downloadSection.classList.add('hidden');
+
+            setTimeout(() => {
+                const edgeCounts = new Map();
+                const edgeGeom = new Map();
+
+                const features = currentGeoJSON.features || (currentGeoJSON.type === 'Feature' ? [currentGeoJSON] : []);
+                
+                // 1. Подсчет всех ребер (отрезков между точками) во всех полигонах
+                for (const feature of features) {
+                    const geom = feature.geometry;
+                    if (!geom) continue;
+
+                    let coords = [];
+                    if (geom.type === 'Polygon') coords = geom.coordinates;
+                    else if (geom.type === 'MultiPolygon') {
+                        for (const poly of geom.coordinates) coords.push(...poly);
+                    }
+
+                    for (const ring of coords) {
+                        for (let j = 0; j < ring.length - 1; j++) {
+                            const p1 = ring[j];
+                            const p2 = ring[j+1];
+                            const p1Str = ptToStr(p1);
+                            const p2Str = ptToStr(p2);
+
+                            if (p1Str === p2Str) continue;
+
+                            // Сортируем координаты ребра, чтобы направление "туда" и "обратно" считалось одним ребром
+                            const key = p1Str < p2Str ? `${p1Str}|${p2Str}` : `${p2Str}|${p1Str}`;
+                            edgeCounts.set(key, (edgeCounts.get(key) || 0) + 1);
+                            edgeGeom.set(key, [p1Str, p2Str]);
+                        }
+                    }
+                }
+
+                // 2. Отбор только ВНЕШНИХ ребер (которые встречаются в файле ровно 1 раз)
+                const extAdj = new Map(); 
+                
+                for (const [key, count] of edgeCounts.entries()) {
+                    if (count === 1) { 
+                        const [s1, s2] = edgeGeom.get(key);
+                        if (!extAdj.has(s1)) extAdj.set(s1, new Set());
+                        if (!extAdj.has(s2)) extAdj.set(s2, new Set());
+                        extAdj.get(s1).add(s2);
+                        extAdj.get(s2).add(s1);
+                    }
+                }
+
+                if (extAdj.size === 0) {
+                    updateStatus('Ошибка: Не найдено внешних контуров.', true);
+                    return;
+                }
+
+                // 3. Сшивка разрозненных ребер в непрерывные линии
+                const visitedEdges = new Set();
+                const multiLines = [];
+                
+                function getEStr(s1, s2) { return s1 < s2 ? `${s1}|${s2}` : `${s2}|${s1}`; }
+
+                for (const [startNode, neighbors] of extAdj.entries()) {
+                    for (const startNeighbor of neighbors) {
+                        let eStr = getEStr(startNode, startNeighbor);
+                        if (visitedEdges.has(eStr)) continue;
+
+                        let currentPathStr = [startNode, startNeighbor];
+                        visitedEdges.add(eStr);
+                        
+                        let current = startNeighbor;
+                        let prev = startNode;
+
+                        while (true) {
+                            let nextCandidates = Array.from(extAdj.get(current)).filter(n => n !== prev);
+                            let next = null;
+                            for (let cand of nextCandidates) {
+                                let candEStr = getEStr(current, cand);
+                                if (!visitedEdges.has(candEStr)) {
+                                    next = cand;
+                                    visitedEdges.add(candEStr);
+                                    break;
+                                }
+                            }
+                            
+                            if (next) {
+                                currentPathStr.push(next);
+                                prev = current;
+                                current = next;
+                            } else {
+                                break;
+                            }
+                        }
+                        
+                        multiLines.push(currentPathStr.map(s => coordsDict.get(s)));
+                    }
+                }
+
+                // 4. Формирование финального GeoJSON файла
+                const outGeoJSON = {
+                    type: "FeatureCollection",
+                    features: [{
+                        type: "Feature",
+                        geometry: {
+                            type: "MultiLineString", // Используем мульти-линию для поддержки островов (напр. Змеиный)
+                            coordinates: multiLines
+                        },
+                        properties: {
+                            name: "Full Outer Boundary",
+                            segments_count: multiLines.length
+                        }
+                    }]
+                };
+
+                displayAndDownloadGeoJSON(outGeoJSON, "Полный внешний контур");
+            }, 50);
+        });
     </script>
 </body>
 </html>
